@@ -15,29 +15,197 @@ jobs:
       - name: Apply diagnostics patch
         run: |
           cat > /tmp/diag.diff <<'PATCH_EOF'
+          diff --git a/EmeraldSDHC/EmeraldSDHCBlockStorageDevice.hpp b/EmeraldSDHC/EmeraldSDHCBlockStorageDevice.hpp
+          index fe9234e..7561b60 100644
+          --- a/EmeraldSDHC/EmeraldSDHCBlockStorageDevice.hpp
+          +++ b/EmeraldSDHC/EmeraldSDHCBlockStorageDevice.hpp
+          @@ -149,6 +149,8 @@ private:
+             bool switchMMCSpeed();
+             bool tuneCard(SDABusWidth busWidth);
+             bool setMMCSpeed(MMCTimingSpeed speed);
+          +  bool switchMMCHS400();
+          +  bool verifyMMCMode(MMCTimingSpeed expected);
+             bool initCard();
+           
+             //
           diff --git a/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp b/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
-          index c420ea4..8e635e8 100644
+          index c420ea4..0dfd790 100644
           --- a/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
           +++ b/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
-          @@ -565,6 +565,16 @@ bool EmeraldSDHCBlockStorageDevice::switchMMCSpeed() {
+          @@ -519,32 +519,14 @@ bool EmeraldSDHCBlockStorageDevice::switchMMCExtendedCSD(MMCSwitchAccessBits acc
+           }
+           
+           bool EmeraldSDHCBlockStorageDevice::switchMMCSpeed() {
+          -  /*SDABusWidth busWidth;
+          -  MMCTimingSpeed speed;
+          -
+          -  //
+          -  // Set speed to max supported.
+          -  //
+          -  if (_mmcExtendedCSD.deviceType & (kMMCDeviceTypeHS400_DDR_1_2V | kMMCDeviceTypeHS400_DDR_1_8V)) {
+          -    busWidth = kSDABusWidth8;
+          -    speed = kMMCTimingSpeedHS200;
+          -  } else if (_mmcExtendedCSD.deviceType & (kMMCDeviceTypeHS200_SDR_1_2V | kMMCDeviceTypeHS200_SDR_1_8V)) {
+          -    busWidth = kSDABusWidth8;
+          -    speed = kMMCTimingSpeedHS200;
+          -  } else if (_mmcExtendedCSD.deviceType & (kMMCDeviceTypeHighSpeed_DDR_52MHz_1_2V | kMMCDeviceTypeHighSpeed_DDR_52MHz_1_8V_3V)) {
+          -    
+          -  }*/
+          -
+          -  setCardBusWidth(kSDABusWidth8, false);
+          -
+          -  setMMCSpeed(kMMCTimingSpeedHS200);
+          -  _cardSlot->setControllerClock(200 * MHz);
+          -  
+          -  tuneCard(kSDABusWidth8);
+          -
+          -  
+             UInt64 hostCaps = _cardSlot->getControllerCapabilities();
+          -  EMDBGLOG("Host controller slot capabilities: 0x%llX", hostCaps);
+          +  UInt8 cardType = _mmcExtendedCSD.deviceType;
+          +  bool hostHS400 = ((hostCaps >> 63) & 1) != 0;   // Linux: CAP bit63 == HS400 support
+          +  bool cardHS400 = (cardType & kMMCDeviceTypeHS400_DDR_1_8V) != 0;
+          +  bool hostHS200 = (hostCaps & kSDHCRegCapabilitiesSRD104Supported) != 0;
+          +
+          +  EMDBGLOG("Host caps 0x%llX, card deviceType 0x%X, hostHS400 %u, cardHS400 %u",
+          +           hostCaps, cardType, hostHS400, cardHS400);
+           
+             //
+             // Determine DMA support level.
+          @@ -559,15 +541,129 @@ bool EmeraldSDHCBlockStorageDevice::switchMMCSpeed() {
+               EMDBGLOG("No DMA support, using PIO");
+               _hcTransferType = kSDATransferTypePIO;
+             }
+          -  EMDBGLOG("No DMA support, using PIO");
+             _cardSlot->setControllerDMAMode(_hcTransferType);
+          -  
+          +
+          +  //
+          +  // 8-bit bus is a prerequisite for both HS200 and HS400.
+          +  //
+          +  bool bus8 = setCardBusWidth(kSDABusWidth8, false);
+          +  EMDBGLOG("8-bit SDR bus: %s", bus8 ? "OK" : "FAILED");
+          +  if (!bus8) {
+          +    setCardBusWidth(kSDABusWidth4, false);
+          +  }
+          +  SDABusWidth busWidth = bus8 ? kSDABusWidth8 : kSDABusWidth4;
+          +
+          +  //
+          +  // Try HS400 first (8-bit DDR @ 200 MHz -> 400 MB/s theoretical).
+          +  //
+          +  if (bus8 && hostHS400 && cardHS400) {
+          +    if (switchMMCHS400()) {
+          +      setProperty("EmeraldSDHCTimingMode", "HS400");
+          +      EMDBGLOG("HS400 established");
+          +      goto done;
+          +    }
+          +    EMSYSLOG("HS400 failed, rolling back to HS200");
+          +    _cardSlot->setControllerClock(kSDAInitSpeedClock400kHz);
+          +    setMMCSpeed(kMMCTimingSpeedDefault);
+          +    IOSleep(20);
+          +    setCardBusWidth(kSDABusWidth8, false);
+          +  }
+          +
+          +  //
+          +  // HS200 fallback (8-bit SDR @ 200 MHz).
+          +  //
+          +  if (hostHS200 &&
+          +      (cardType & (kMMCDeviceTypeHS200_SDR_1_8V | kMMCDeviceTypeHS200_SDR_1_2V))) {
+          +    if (setMMCSpeed(kMMCTimingSpeedHS200) &&
+          +        _cardSlot->setControllerClock(200 * MHz) &&
+          +        tuneCard(busWidth) &&
+          +        verifyMMCMode(kMMCTimingSpeedHS200)) {
+          +      setProperty("EmeraldSDHCTimingMode", "HS200");
+          +      EMDBGLOG("HS200 established");
+          +      goto done;
+          +    }
+          +    EMSYSLOG("HS200 failed, falling back to HighSpeed");
+          +    _cardSlot->setControllerClock(kSDAInitSpeedClock400kHz);
+          +    setMMCSpeed(kMMCTimingSpeedDefault);
+          +    IOSleep(20);
+          +    setCardBusWidth(busWidth, false);
+          +  }
+          +
+          +  //
+          +  // Last resort: 52 MHz HighSpeed on the widest working bus.
+          +  //
+          +  if (!setMMCSpeed(kMMCTimingSpeedHighSpeed)) {
+          +    setMMCSpeed(kMMCTimingSpeedDefault);
+          +  }
+          +  _cardSlot->setControllerClock(_mmcMaxStandardClock);
+          +  setProperty("EmeraldSDHCTimingMode", "HighSpeed");
+          +
+          +done:
              memset(&_mmcExtendedCSD, 0, sizeof (_mmcExtendedCSD));
              parseMMCExtendedCSD();
            
-          +  //
-          +  // DIAGNOSTIC: expose negotiated MMC state via the IORegistry.
-          +  //
           +  setProperty("MMCDeviceType", _mmcExtendedCSD.deviceType, 8);
           +  setProperty("MMCBusWidth", _mmcExtendedCSD.busWidth, 8);
           +  setProperty("MMCHsTiming", _mmcExtendedCSD.hsTiming & 0x0F, 8);
-          +  setProperty("MMCPowerClass", _mmcExtendedCSD.powerClass, 8);
-          +  setProperty("MMCDriverStrength", _mmcExtendedCSD.driverStrength, 8);
           +  setProperty("HostCapabilities", (UInt64)hostCaps, 64);
           +
              return true;
            }
            
+          +bool EmeraldSDHCBlockStorageDevice::switchMMCHS400() {
+          +  //
+          +  // JEDEC HS400 entry sequence, mirrors Linux mmc_select_hs400():
+          +  //   1. downgrade card to HS timing and drop the clock
+          +  //   2. switch card to 8-bit DDR bus width (EXT_CSD BUS_WIDTH = 6)
+          +  //   3. switch card to HS400 timing (EXT_CSD HS_TIMING = 3)
+          +  //   4. raise clock to 200 MHz and put host into HS400 mode
+          +  //   5. re-tune and verify
+          +  //
+          +  if (!setMMCSpeed(kMMCTimingSpeedHighSpeed)) {
+          +    EMSYSLOG("HS400: failed to switch card to HS timing");
+          +    return false;
+          +  }
+          +  if (!_cardSlot->setControllerClock(_mmcMaxStandardClock)) {
+          +    EMSYSLOG("HS400: failed to drop clock to HS speed");
+          +    return false;
+          +  }
+          +  IOSleep(2);
+          +
+          +  if (!setCardBusWidth(kSDABusWidth8, true)) {
+          +    EMSYSLOG("HS400: failed to select 8-bit DDR bus");
+          +    return false;
+          +  }
+          +  IOSleep(2);
+          +
+          +  if (!setMMCSpeed(kMMCTimingSpeedHS400)) {
+          +    EMSYSLOG("HS400: failed to switch card to HS400 timing");
+          +    return false;
+          +  }
+          +  IOSleep(2);
+          +
+          +  if (!_cardSlot->setControllerClock(200 * MHz)) {
+          +    EMSYSLOG("HS400: failed to set 200 MHz");
+          +    return false;
+          +  }
+          +  IOSleep(5);
+          +
+          +  if (!tuneCard(kSDABusWidth8)) {
+          +    EMSYSLOG("HS400: tuning failed");
+          +    return false;
+          +  }
+          +
+          +  return verifyMMCMode(kMMCTimingSpeedHS400);
+          +}
+          +
+          +bool EmeraldSDHCBlockStorageDevice::verifyMMCMode(MMCTimingSpeed expected) {
+          +  memset(&_mmcExtendedCSD, 0, sizeof (_mmcExtendedCSD));
+          +  parseMMCExtendedCSD();
+          +  UInt8 got = _mmcExtendedCSD.hsTiming & 0x0F;
+          +  EMDBGLOG("Verify timing: expected %u actual %u busWidth 0x%X",
+          +           (UInt8)expected, got, _mmcExtendedCSD.busWidth);
+          +  return got == (UInt8)expected;
+          +}
+          +
+           bool EmeraldSDHCBlockStorageDevice::tuneCard(SDABusWidth busWidth) {
+             bool tuningComplete = true;
+           
           diff --git a/EmeraldSDHC/EmeraldSDHCSlot.cpp b/EmeraldSDHC/EmeraldSDHCSlot.cpp
-          index 5ceeb6b..5eca810 100644
+          index 5ceeb6b..15ddfe7 100644
           --- a/EmeraldSDHC/EmeraldSDHCSlot.cpp
           +++ b/EmeraldSDHC/EmeraldSDHCSlot.cpp
           @@ -214,17 +214,21 @@ bool EmeraldSDHCSlot::setControllerClock(UInt32 speedHz) {
@@ -50,8 +218,8 @@ jobs:
           -           speedHz >= MHz ? (baseClock / clockDiv) / MHz : (baseClock / clockDiv) / kHz,
           -           speedHz >= MHz ? "MHz" : "kHz", clockDiv);
           +  //
-          +  // SDHCI: FREQ_SEL stores half of the real divisor (N=0 means base clock).
-          +  // The original code wrote the divisor directly, halving the real SDCLK.
+          +  // SDHCI: FREQ_SEL stores half of the real divisor (0 selects the base clock).
+          +  // Writing the divisor directly halved the real SDCLK.
           +  //
           +  UInt32 clockDiv = 1;
           +  for (clockDiv = 1; clockDiv < 4096 && (baseClock / clockDiv) > speedHz; clockDiv <<= 1);
@@ -69,6 +237,18 @@ jobs:
              writeReg16(kSDHCRegClockControl, readReg16(kSDHCRegClockControl) | newClockDiv);
              writeReg16(kSDHCRegClockControl, readReg16(kSDHCRegClockControl) | kSDHCRegClockControlSDClockEnable);
              EMDBGLOG("Clock control register is now 0x%X", readReg16(kSDHCRegClockControl));
+          diff --git a/EmeraldSDHC/SDRegs.hpp b/EmeraldSDHC/SDRegs.hpp
+          index 589324a..1dc6acd 100644
+          --- a/EmeraldSDHC/SDRegs.hpp
+          +++ b/EmeraldSDHC/SDRegs.hpp
+          @@ -171,6 +171,7 @@
+           #define kSDHCRegCapabilitiesVoltage3_3Supported   BIT24
+           #define kSDHCRegCapabilitiesVoltage3_0Supported   BIT25
+           #define kSDHCRegCapabilitiesVoltage1_8Supported   BIT26
+          +#define kSDHCRegCapabilitiesSRD104Supported        (1ULL << 33)
+           #define kSDHCRegCapabilitiesSlotTypeEmbedded      BIT30
+           
+           #define kSDHCRegMaxCurrentCapabilities  0x48
           PATCH_EOF
           cd repo
           git apply -v /tmp/diag.diff
@@ -76,7 +256,7 @@ jobs:
       - name: Verify patch applied to SOURCE
         run: |
           set -e
-          grep -q 'MMCDeviceType' repo/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
+          grep -q 'switchMMCHS400' repo/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
           grep -q 'HostCapabilities' repo/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
           echo "SOURCE PATCH OK"
 
@@ -105,10 +285,10 @@ jobs:
           mkdir -p out
           cp -R "$KEXT" out/
           cd out
-          zip -qry ../EmeraldSDHC-clockfix.zip EmeraldSDHC.kext
-          ls -l ../EmeraldSDHC-clockfix.zip
+          zip -qry ../EmeraldSDHC-hs400.zip EmeraldSDHC.kext
+          ls -l ../EmeraldSDHC-hs400.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: EmeraldSDHC-diag
-          path: EmeraldSDHC-clockfix.zip
+          path: EmeraldSDHC-hs400.zip
