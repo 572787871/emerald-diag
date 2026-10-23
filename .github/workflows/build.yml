@@ -1,0 +1,84 @@
+name: Build EmeraldSDHC (ioreg diagnostics)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout MacKernelSDK
+        run: git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
+
+      - name: Checkout EmeraldSDHC
+        run: git clone --depth 1 https://github.com/acidanthera/EmeraldSDHC.git src
+
+      - name: Apply diagnostics patch
+        run: |
+          cat > /tmp/diag.diff <<'PATCH_EOF'
+          diff --git a/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp b/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
+          index c420ea4..6440edb 100644
+          --- a/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
+          +++ b/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
+          @@ -565,6 +565,18 @@ bool EmeraldSDHCBlockStorageDevice::switchMMCSpeed() {
+             memset(&_mmcExtendedCSD, 0, sizeof (_mmcExtendedCSD));
+             parseMMCExtendedCSD();
+           
+          +  //
+          +  // DIAGNOSTIC: expose the negotiated MMC state through the IORegistry so it
+          +  // can be read from userspace (ioreg) instead of relying on kernel logs.
+          +  //
+          +  setProperty("MMCDeviceType", _mmcExtendedCSD.deviceType, 8);
+          +  setProperty("MMCBusWidth", _mmcExtendedCSD.busWidth, 8);
+          +  setProperty("MMCHsTiming", _mmcExtendedCSD.hsTiming & 0x0F, 8);
+          +  setProperty("MMCDriverStrength", _mmcExtendedCSD.driverStrength, 8);
+          +  setProperty("MMCPowerClass", _mmcExtendedCSD.powerClass, 8);
+          +  setProperty("MMCMaxClockHz", (UInt32)_mmcMaxStandardClock, 32);
+          +  setProperty("HostCapabilities", (UInt64)hostCaps, 64);
+          +
+             return true;
+           }
+           
+          PATCH_EOF
+          cd src
+          git apply -v /tmp/diag.diff
+
+      - name: Verify patch applied to SOURCE
+        run: |
+          set -e
+          grep -q 'MMCDeviceType' src/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
+          grep -q 'HostCapabilities' src/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
+          echo "SOURCE PATCH OK"
+
+      - name: Build Release
+        run: |
+          cd src
+          xcodebuild -project EmeraldSDHC.xcodeproj -scheme EmeraldSDHC -configuration Release -derivedDataPath /tmp/dd CODE_SIGNING_ALLOWED=NO build
+
+      - name: Verify patch present in BINARY
+        run: |
+          set -e
+          BIN=$(find /tmp/dd -name EmeraldSDHC -type f -path '*MacOS*' | head -1)
+          echo "BINARY: $BIN"
+          if strings "$BIN" | grep -q 'MMCDeviceType'; then
+            echo "BINARY PATCH OK"
+          else
+            echo "BINARY PATCH MISSING"
+            exit 1
+          fi
+          shasum -a 256 "$BIN"
+
+      - name: Package
+        run: |
+          set -e
+          KEXT=$(find /tmp/dd -name 'EmeraldSDHC.kext' -maxdepth 8 | head -1)
+          mkdir -p out
+          cp -R "$KEXT" out/
+          cd out
+          zip -qry ../EmeraldSDHC-diag.zip EmeraldSDHC.kext
+          ls -l ../EmeraldSDHC-diag.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EmeraldSDHC-diag
+          path: EmeraldSDHC-diag.zip
