@@ -29,7 +29,7 @@ jobs:
            
              //
           diff --git a/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp b/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
-          index c420ea4..6d79e67 100644
+          index c420ea4..ce2f212 100644
           --- a/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
           +++ b/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
           @@ -519,32 +519,14 @@ bool EmeraldSDHCBlockStorageDevice::switchMMCExtendedCSD(MMCSwitchAccessBits acc
@@ -72,7 +72,7 @@ jobs:
            
              //
              // Determine DMA support level.
-          @@ -559,17 +541,116 @@ bool EmeraldSDHCBlockStorageDevice::switchMMCSpeed() {
+          @@ -559,17 +541,135 @@ bool EmeraldSDHCBlockStorageDevice::switchMMCSpeed() {
                EMDBGLOG("No DMA support, using PIO");
                _hcTransferType = kSDATransferTypePIO;
              }
@@ -107,13 +107,33 @@ jobs:
           +  }
           +
           +  //
-          +  // No fallback requested: HS400 only. If it did not succeed the card is
-          +  // left unconfigured and initialization fails (visible as a prohibited sign).
+          +  // HS200 fallback (8-bit SDR @ 200 MHz).
           +  //
-          +  EMSYSLOG("HS400 not established (hostHS400=%u cardHS400=%u bus8=%u)",
-          +           hostHS400, cardHS400, bus8);
-          +  setProperty("EmeraldSDHCTimingMode", "NONE");
-          +  return false;
+          +  if (hostHS200 &&
+          +      (cardType & (kMMCDeviceTypeHS200_SDR_1_8V | kMMCDeviceTypeHS200_SDR_1_2V))) {
+          +    if (setMMCSpeed(kMMCTimingSpeedHS200) &&
+          +        _cardSlot->setControllerClock(200 * MHz) &&
+          +        tuneCard(busWidth) &&
+          +        verifyMMCMode(kMMCTimingSpeedHS200)) {
+          +      setProperty("EmeraldSDHCTimingMode", "HS200");
+          +      EMDBGLOG("HS200 established");
+          +      goto done;
+          +    }
+          +    EMSYSLOG("HS200 failed, falling back to HighSpeed");
+          +    _cardSlot->setControllerClock(kSDAInitSpeedClock400kHz);
+          +    setMMCSpeed(kMMCTimingSpeedDefault);
+          +    IOSleep(20);
+          +    setCardBusWidth(busWidth, false);
+          +  }
+          +
+          +  //
+          +  // Last resort: 52 MHz HighSpeed on the widest working bus.
+          +  //
+          +  if (!setMMCSpeed(kMMCTimingSpeedHighSpeed)) {
+          +    setMMCSpeed(kMMCTimingSpeedDefault);
+          +  }
+          +  _cardSlot->setControllerClock(_mmcMaxStandardClock);
+          +  setProperty("EmeraldSDHCTimingMode", "HighSpeed");
           +
           +done:
              memset(&_mmcExtendedCSD, 0, sizeof (_mmcExtendedCSD));
@@ -173,7 +193,6 @@ jobs:
           +    return false;
           +  }
           +
-          +  setProperty("HS400Stage", "5-verify");
           +  return verifyMMCMode(kMMCTimingSpeedHS400);
           +}
           +
@@ -192,7 +211,7 @@ jobs:
            
              UInt16 bytesLength = 0;
              if (busWidth == kSDABusWidth4) {
-          @@ -594,11 +675,20 @@ bool EmeraldSDHCBlockStorageDevice::tuneCard(SDABusWidth busWidth) {
+          @@ -594,12 +694,19 @@ bool EmeraldSDHCBlockStorageDevice::tuneCard(SDABusWidth busWidth) {
              //
              EMDBGLOG("Starting tuning of card using %u bytes", bytesLength);
              _cardSlot->writeReg16(kSDHCRegHostControl2, _cardSlot->readReg16(kSDHCRegHostControl2) | kSDHCRegHostControl2ExecuteTuning);
@@ -202,19 +221,18 @@ jobs:
           +    tuningLoops++;
                if (doSyncCommandWithData(kMMCCommandSendTuningBlock, 0, kSDATimeout_10sec, 1, bytesLength, bufDescriptor, 0) != kIOReturnSuccess) {
           -      tuningComplete = false;
-                 break;
-               }
+          +      break;
+          +    }
           +    UInt16 hc2 = _cardSlot->readReg16(kSDHCRegHostControl2);
           +    if ((hc2 & kSDHCRegHostControl2ExecuteTuning) == 0) {
           +      tuningComplete = (hc2 & kSDHCRegHostControl2SamplingClockSelect) != 0;
-          +      break;
-          +    }
-          +  }
-          +  if (!tuningComplete) {
-          +    EMSYSLOG("Tuning did not converge after %u loops", tuningLoops);
+                 break;
+               }
              }
+          +  if (!tuningComplete) EMSYSLOG("Tuning did not converge after %u loops", tuningLoops);
              EMDBGLOG("Tuning complete: %u", tuningComplete); // TODO: handle tuning error interrupts?
            
+             bufDescriptor->complete();
           diff --git a/EmeraldSDHC/EmeraldSDHCSlot.cpp b/EmeraldSDHC/EmeraldSDHCSlot.cpp
           index 5ceeb6b..15ddfe7 100644
           --- a/EmeraldSDHC/EmeraldSDHCSlot.cpp
@@ -296,10 +314,10 @@ jobs:
           mkdir -p out
           cp -R "$KEXT" out/
           cd out
-          zip -qry ../EmeraldSDHC-hs400only.zip EmeraldSDHC.kext
-          ls -l ../EmeraldSDHC-hs400only.zip
+          zip -qry ../EmeraldSDHC-hs400diag.zip EmeraldSDHC.kext
+          ls -l ../EmeraldSDHC-hs400diag.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: EmeraldSDHC-diag
-          path: EmeraldSDHC-hs400only.zip
+          path: EmeraldSDHC-hs400diag.zip
