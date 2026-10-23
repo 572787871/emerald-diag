@@ -49,10 +49,10 @@ jobs:
           grep -q 'HostCapabilities' repo/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
           echo "SOURCE PATCH OK"
 
-      - name: Build Release
+      - name: Build Debug
         run: |
           cd repo
-          xcodebuild -project EmeraldSDHC.xcodeproj -scheme EmeraldSDHC -configuration Release -derivedDataPath /tmp/dd CODE_SIGNING_ALLOWED=NO build
+          xcodebuild -project EmeraldSDHC.xcodeproj -scheme EmeraldSDHC -configuration Debug -derivedDataPath /tmp/dd CODE_SIGNING_ALLOWED=NO build
 
       - name: Verify patch present in BINARY
         run: |
@@ -74,10 +74,10 @@ jobs:
           mkdir -p out
           cp -R "$KEXT" out/
           cd out
-          zip -qry ../EmeraldSDHC-diag.zip EmeraldSDHC.kext
-          ls -l ../EmeraldSDHC-diag.zip
+          zip -qry ../EmeraldSDHC-diagdbg.zip EmeraldSDHC.kext
+          ls -l ../EmeraldSDHC-diagdbg.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: EmeraldSDHC-diag
-          path: EmeraldSDHC-diag.zip
+          path: EmeraldSDHC-diagdbg.zip
