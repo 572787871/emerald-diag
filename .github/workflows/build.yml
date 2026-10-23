@@ -7,11 +7,10 @@ jobs:
   build:
     runs-on: macos-14
     steps:
-      - name: Checkout MacKernelSDK
-        run: git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
-
-      - name: Checkout EmeraldSDHC
-        run: git clone --depth 1 https://github.com/acidanthera/EmeraldSDHC.git src
+      - name: Fetch sources
+        run: |
+          git clone --depth 1 https://github.com/acidanthera/EmeraldSDHC.git repo
+          git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git repo/MacKernelSDK
 
       - name: Apply diagnostics patch
         run: |
@@ -40,19 +39,19 @@ jobs:
            }
            
           PATCH_EOF
-          cd src
+          cd repo
           git apply -v /tmp/diag.diff
 
       - name: Verify patch applied to SOURCE
         run: |
           set -e
-          grep -q 'MMCDeviceType' src/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
-          grep -q 'HostCapabilities' src/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
+          grep -q 'MMCDeviceType' repo/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
+          grep -q 'HostCapabilities' repo/EmeraldSDHC/EmeraldSDHCBlockStorageDeviceCard.cpp
           echo "SOURCE PATCH OK"
 
       - name: Build Release
         run: |
-          cd src
+          cd repo
           xcodebuild -project EmeraldSDHC.xcodeproj -scheme EmeraldSDHC -configuration Release -derivedDataPath /tmp/dd CODE_SIGNING_ALLOWED=NO build
 
       - name: Verify patch present in BINARY
